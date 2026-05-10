@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "pair": {
+        "title": "Add AION Home",
+        "description": "{qr_markdown}\n\n1. In the AION Home app open Profile > Assistants > Home Assistant.\n2. Tap Scan QR and scan the code shown above.\n3. Wait for the success message in the app, then come back here and click Submit."
+      }
+    },
+    "error": {
+      "cannot_connect": "The AION gateway could not complete the pairing exchange.",
+      "invalid_auth": "The embedded gateway API key was rejected or the link was revoked.",
+      "pairing_not_found": "Pairing not found. Please scan the QR code in the AION app from Profile > Assistants > Home Assistant before clicking Submit.",
+      "pairing_consumed": "This QR code has already been used. A new QR code has been generated — please scan it again from Profile > Assistants > Home Assistant and click Submit.",
+      "unknown": "Unexpected pairing error."
+    },
+    "abort": {
+      "already_configured": "This AION Home link is already configured."
+    }
+  },
+  "services": {
+    "send_aux_command": {
+      "name": "Send auxiliary command",
+      "description": "Send a raw AION auxiliary, IR, AC, or restart command to a linked entity."
+    },
+    "resync_gateway": {
+      "name": "Resync gateway",
+      "description": "Force the integration to refresh the normalized bootstrap payload from the AION gateway."
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "domain": "aion_home",
+  "name": "AION Home",
+  "version": "0.1.0",
+  "config_flow": true,
+  "iot_class": "local_polling",
+  "requirements": [
+    "pycryptodome==3.20.0",
+    "qrcode[pil]==7.4.2"
+  ]
+}

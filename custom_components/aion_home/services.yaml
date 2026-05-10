@@ -1,0 +1,39 @@
+send_aux_command:
+  name: Send Auxiliary Command
+  description: Send a raw AION auxiliary, IR, AC, or restart command to an entity.
+  fields:
+    entity_id:
+      name: Entity
+      description: The AION Home entity that should receive the command.
+      required: true
+      selector:
+        entity:
+          integration: aion_home
+    command_type:
+      name: Command Type
+      description: The low-level command channel to use.
+      required: true
+      selector:
+        select:
+          options:
+            - aux
+            - ir
+            - ac
+            - restart
+    command_payload:
+      name: Command Payload
+      description: Raw JSON-like payload for aux, IR, or AC commands.
+      required: false
+      example:
+        st: "20"
+
+resync_gateway:
+  name: Resync Gateway
+  description: Force the integration to fetch the latest normalized bootstrap from the AION gateway.
+  fields:
+    entry_id:
+      name: Config Entry Id
+      description: Optional AION Home config entry id. Leave empty to refresh all loaded AION entries.
+      required: false
+      selector:
+        text:
