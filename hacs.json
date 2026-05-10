@@ -1,6 +1,5 @@
 {
   "name": "AION Home",
-  "domains": ["aion_home"],
   "render_readme": false,
   "homeassistant": "2024.4.0"
 }
