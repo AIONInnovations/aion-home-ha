@@ -8,6 +8,7 @@ from typing import Any
 from homeassistant.components.remote import RemoteEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -23,20 +24,27 @@ async def async_setup_entry(
     """Load remote descriptors from the coordinator and create remote entities."""
     coordinator = hass.data[DOMAIN][entry.entry_id][DATA_COORDINATOR]
     descriptors = coordinator.get_entities_for_platform("remote")
-    # LOGGER.info("[AION][remote] setup_entry called, found %d remote descriptors", len(descriptors))
-    # Log each remote entity being registered so we can verify commands reach HA.
-    # for desc in descriptors:
-    #     control = desc.get("control", {})
-    #     local = desc.get("local", {})
-    #     LOGGER.info(
-    #         "[AION][remote] registering entity uid=%s name=%s command_count=%s "
-    #         "command_list=%s available=%s",
-    #         desc.get("entity_uid"),
-    #         desc.get("name"),
-    #         len(control.get("command_list", [])),
-    #         control.get("command_list", [])[:10],
-    #         bool(local.get("device_ip")) and bool(local.get("device_ssid")) and bool(local.get("main_key")),
-    #     )
+
+    # Pre-register every IR hub device so sub-remote entities can safely reference
+    # it via via_device without triggering the "non-existing via_device" warning.
+    device_reg = dr.async_get(hass)
+    registered_hub_uids: set[str] = set()
+    for descriptor in descriptors:
+        device = descriptor.get("device", {})
+        control = descriptor.get("control", {})
+        device_uid: str = device.get("device_uid", "")
+        remote_id: str = control.get("remote_id", "")
+        if remote_id and device_uid and device_uid not in registered_hub_uids:
+            device_reg.async_get_or_create(
+                config_entry_id=entry.entry_id,
+                identifiers={(DOMAIN, device_uid)},
+                manufacturer="AION",
+                model="IR Hub",
+                name=device.get("device_name", "IR Hub"),
+                suggested_area=device.get("room_name", ""),
+            )
+            registered_hub_uids.add(device_uid)
+
     async_add_entities(
         AionHomeRemoteEntity(coordinator, descriptor)
         for descriptor in descriptors

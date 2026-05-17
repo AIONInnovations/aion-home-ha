@@ -1,15 +1,15 @@
-"""Light platform for dimmable AION Home devices."""
+"""Light platform for AION Home light devices."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.light import ColorMode, LightEntity
+from homeassistant.components.light import ATTR_BRIGHTNESS, ColorMode, LightEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DATA_COORDINATOR, DOMAIN
+from .const import BRIGHTNESS_CATEGORIES, DATA_COORDINATOR, DOMAIN
 from .entity import AionHomeBaseEntity
 from .helpers import brightness_to_percent, percent_to_brightness
 
@@ -32,8 +32,10 @@ class AionHomeLightEntity(AionHomeBaseEntity, LightEntity):
 
     @property
     def _is_dimmable(self) -> bool:
-        """Return True when the gateway descriptor carries a brightness_percent value."""
-        return "brightness_percent" in self.descriptor.get("state", {})
+        """Return True when the device category supports brightness control."""
+        device = self.descriptor.get("device", {})
+        category = device.get("category") or self.descriptor.get("category")
+        return category in BRIGHTNESS_CATEGORIES
 
     @property
     def supported_color_modes(self) -> set[ColorMode]:
@@ -59,21 +61,20 @@ class AionHomeLightEntity(AionHomeBaseEntity, LightEntity):
         """Return the current brightness in HA's 0-255 scale, or None for ONOFF lights."""
         if not self._is_dimmable:
             return None
-        return percent_to_brightness(
-            self.descriptor.get("state", {}).get("brightness_percent", 0)
-        )
+        brightness_percent = self.descriptor.get("state", {}).get("brightness_percent")
+        if brightness_percent is None:
+            return None
+        return percent_to_brightness(brightness_percent)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on the light; applies brightness only when the device is dimmable."""
-        if self._is_dimmable:
-            brightness_percent = brightness_to_percent(kwargs.get("brightness", 255))
+        command_value = 100
+        if self._is_dimmable and ATTR_BRIGHTNESS in kwargs:
+            brightness_percent = brightness_to_percent(kwargs[ATTR_BRIGHTNESS])
             # Firmware only accepts discrete 10-step levels (0, 10, 20, … 100).
             snapped = max(0, min(100, round(brightness_percent / 10) * 10))
             # Use 10 as minimum "on" value so we never send 0 when turning on.
             command_value = snapped if snapped > 0 else 10
-        else:
-            # Non-dimmable light: firmware uses 100/0 same as switches.
-            command_value = 100
         state_patch = await self.coordinator.local_client.async_execute_primary(
             descriptor=self.descriptor,
             command_value=command_value,

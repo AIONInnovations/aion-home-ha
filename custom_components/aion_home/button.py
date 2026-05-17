@@ -9,6 +9,7 @@ from typing import Any
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -36,8 +37,29 @@ async def async_setup_entry(
 
     # IR command buttons — one pressable tile per command on every remote entity.
     ir_buttons: list[AionHomeIRCommandButton] = []
+    remote_descriptors = coordinator.get_entities_for_platform("remote")
 
-    for remote_desc in coordinator.get_entities_for_platform("remote"):
+    # Pre-register hub devices so IR button entities can reference them via via_device
+    # without triggering the "non-existing via_device" warning in HA 2025.12+.
+    device_reg = dr.async_get(hass)
+    registered_hub_uids: set[str] = set()
+    for remote_desc in remote_descriptors:
+        device = remote_desc.get("device", {})
+        control = remote_desc.get("control", {})
+        device_uid: str = device.get("device_uid", "")
+        remote_id: str = control.get("remote_id", "")
+        if remote_id and device_uid and device_uid not in registered_hub_uids:
+            device_reg.async_get_or_create(
+                config_entry_id=entry.entry_id,
+                identifiers={(DOMAIN, device_uid)},
+                manufacturer="AION",
+                model="IR Hub",
+                name=device.get("device_name", "IR Hub"),
+                suggested_area=device.get("room_name", ""),
+            )
+            registered_hub_uids.add(device_uid)
+
+    for remote_desc in remote_descriptors:
         control = remote_desc.get("control", {})
         if control.get("family") != "ir":
             continue
@@ -47,11 +69,6 @@ async def async_setup_entry(
                 AionHomeIRCommandButton(coordinator, remote_desc, command_name)
             )
 
-    # LOGGER.info(
-    #     "[AION][button] setup_entry: aux_buttons=%d ir_command_buttons=%d",
-    #     len(aux_buttons),
-    #     len(ir_buttons),
-    # )
     async_add_entities(aux_buttons + ir_buttons)
 
 

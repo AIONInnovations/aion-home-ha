@@ -4,18 +4,19 @@ from __future__ import annotations
 
 from typing import Any
 import logging
+from urllib.parse import quote
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from homeassistant.exceptions import HomeAssistantError
 
-from ._aion_protocol import AionProtocolCore, AionProtocolError
+from ._aion_protocol_source import AionProtocolCore, AionProtocolError
+
 from .const import FAN_MODE_MAP, HVAC_MODE_MAP, SESSION_TTL_MS
 from .helpers import to_bool
 
 LOGGER = logging.getLogger(__name__)
 
 _REQUIRED_LOCAL_FIELDS = frozenset({"device_ip", "device_ssid", "ssid_suffix", "main_key"})
-_MISSING = object()
 
 
 class AionLocalError(HomeAssistantError):
@@ -30,16 +31,6 @@ class AionLocalClient:
         self._session = session
         self._protocol = AionProtocolCore()
         self._session_cache: dict[str, dict[str, Any]] = {}
-
-    def _invalidate_session(self, local: dict[str, Any], reason: str) -> None:
-        """Drop one cached LAN session after a crypto or auth failure poisons it."""
-        device_ssid = str(local.get("device_ssid", ""))
-        if not device_ssid:
-            return
-
-        self._session_cache.pop(device_ssid, None)
-
-
 
     async def async_execute_primary(
         self,
@@ -182,10 +173,44 @@ class AionLocalClient:
                 descriptor,
                 local,
                 session_state,
-                command_payload
+                command_payload,
             )
         except AionProtocolError as error:
             raise AionLocalError(str(error)) from error
+
+    def _build_candidate_urls(
+        self,
+        local: dict[str, Any],
+        endpoint: str,
+        encoded_cipher: str,
+        iv_hex: str,
+    ) -> list[str]:
+        """Build the known LAN URL variants used by different AION firmware builds."""
+        base_url = f"http://{local['device_ip']}"
+        endpoint_segment = quote(endpoint.strip("/"), safe="")
+        raw_device_ssid = str(local.get("device_ssid", "")).strip().strip("/")
+        raw_ssid_suffix = str(local.get("ssid_suffix", "")).strip().strip("/")
+
+        path_variants: list[tuple[str, ...]] = []
+        if raw_device_ssid:
+            path_variants.append((raw_device_ssid, endpoint_segment))
+        if raw_ssid_suffix and raw_ssid_suffix != raw_device_ssid:
+            path_variants.append((raw_ssid_suffix, endpoint_segment))
+        path_variants.append((endpoint_segment,))
+
+        urls: list[str] = []
+        seen_urls: set[str] = set()
+        for variant in path_variants:
+            encoded_path = "/".join(quote(part, safe="") for part in variant if part)
+            candidate_url = (
+                f"{base_url}/{encoded_path}?d={encoded_cipher}&v={iv_hex}"
+            )
+            if candidate_url in seen_urls:
+                continue
+            seen_urls.add(candidate_url)
+            urls.append(candidate_url)
+
+        return urls
 
     def _build_init_request(self, local: dict[str, Any]) -> dict[str, Any]:
         """Build the LAN session-init request while normalizing protocol failures."""
@@ -249,11 +274,7 @@ class AionLocalClient:
         """Establish a fresh Z session using the device main key and init endpoint."""
         init_request = self._build_init_request(local)
         response_text = await self._async_send_request(local, init_request)
-        try:
-            return self._finalize_session(response_text, init_request)
-        except AionLocalError as error:
-            self._invalidate_session(local, str(error))
-            raise
+        return self._finalize_session(response_text, init_request)
 
     async def _async_send_request(
         self,
@@ -286,46 +307,53 @@ class AionLocalClient:
         except AionProtocolError as error:
             raise AionLocalError(str(error)) from error
 
-        url = (
-            f"http://{local['device_ip']}/{local['device_ssid']}/{endpoint}"
-            f"?d={encrypted_request['encoded_cipher']}&v={encrypted_request['iv_hex']}"
+        candidate_urls = self._build_candidate_urls(
+            local,
+            endpoint,
+            encrypted_request["encoded_cipher"],
+            encrypted_request["iv_hex"],
         )
 
         timeout = ClientTimeout(total=5)
         try:
-            async with self._session.get(
-                url,
-                headers={
-                    "Content-Type": "application/json",
-                    "Connection": "close",
-                },
-                timeout=timeout,
-            ) as response:
-                raw_response = await response.text()
-                if response.status < 200 or response.status >= 300:
+            for index, url in enumerate(candidate_urls):
+                async with self._session.get(
+                    url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Connection": "close",
+                    },
+                    timeout=timeout,
+                ) as response:
+                    if response.status == 404 and index < len(candidate_urls) - 1:
+                        LOGGER.debug(
+                            "AION local 404 on candidate url=%s — trying next variant",
+                            url.split("?")[0],
+                        )
+                        continue
+
+                    if response.status < 200 or response.status >= 300:
+                        LOGGER.error(
+                            "AION local request failed: status=%s endpoint=%s payload_length=%s "
+                            "device_ip=%s device_ssid=%s ssid_suffix=%s url=%s",
+                            response.status,
+                            endpoint,
+                            len(plaintext),
+                            local.get("device_ip"),
+                            local.get("device_ssid"),
+                            local.get("ssid_suffix"),
+                            url.split("?")[0],
+                        )
+                        raise AionLocalError(f"Device request failed with HTTP {response.status}.")
+
+                    raw_response = await response.text()
                     try:
-                        self._protocol.parse_encrypted_response(
+                        return self._protocol.parse_encrypted_response(
                             raw_response,
                             decryption_key,
                         )
                     except AionProtocolError as error:
-                        self._invalidate_session(local, str(error))
-                    LOGGER.error(
-                        "AION local request failed: status=%s endpoint=%s payload_length=%s",
-                        response.status,
-                        endpoint,
-                        len(plaintext),
-                    )
-                    raise AionLocalError(f"Device request failed with HTTP {response.status}.")
-
-                try:
-                    return self._protocol.parse_encrypted_response(
-                        raw_response,
-                        decryption_key,
-                    )
-                except AionProtocolError as error:
-                    self._invalidate_session(local, str(error))
-                    raise AionLocalError(str(error)) from error
+                        raise AionLocalError(str(error)) from error
         except AionLocalError:
             raise
         except (ClientError, OSError) as error:
@@ -375,55 +403,15 @@ class AionLocalClient:
     ) -> dict[str, Any] | None:
         """Update simple config entities optimistically after a successful aux write."""
         control = descriptor.get("control", {})
-        field_value = self._extract_aux_payload_value(payload, control)
-        if field_value is _MISSING:
-            return None
-
-        if descriptor.get("platform") == "number":
-            return {"native_value": float(field_value)}
-        if descriptor.get("platform") == "switch":
-            return {"is_on": to_bool(field_value)}
-        if descriptor.get("platform") == "select":
-            option_map = control.get("option_map", {})
-            reverse_option_map = {
-                self._normalize_option_lookup_key(raw_value): label
-                for label, raw_value in option_map.items()
-            }
-            return {
-                "current_option": reverse_option_map.get(
-                    self._normalize_option_lookup_key(field_value),
-                    str(field_value),
-                )
-            }
-
-        return None
-
-    def _extract_aux_payload_value(
-        self,
-        payload: dict[str, Any],
-        control: dict[str, Any],
-    ) -> Any:
-        """Resolve the written aux value from either a flat field or a nested payload path."""
-        payload_path = control.get("payload_path")
-        if isinstance(payload_path, list) and payload_path:
-            nested_value: Any = payload
-            for path_segment in payload_path:
-                if not isinstance(nested_value, dict) or path_segment not in nested_value:
-                    return _MISSING
-                nested_value = nested_value[path_segment]
-            return nested_value
-
         field_name = control.get("field")
         if field_name and field_name in payload:
-            return payload[field_name]
+            field_value = payload[field_name]
+            if descriptor.get("platform") == "number":
+                return {"native_value": float(field_value)}
+            if descriptor.get("platform") == "switch":
+                return {"is_on": to_bool(field_value)}
 
-        return _MISSING
-
-    def _normalize_option_lookup_key(self, value: Any) -> str:
-        """Normalize raw option values so optimistic select patches can map them back to labels."""
-        if isinstance(value, str):
-            return value.strip()
-        return str(value)
+        return None
 
     def _build_ac_patch(
         self,

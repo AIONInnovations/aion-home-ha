@@ -30,8 +30,7 @@ class AionHomeSelectEntity(AionHomeBaseEntity, SelectEntity):
     @property
     def options(self) -> list[str]:
         """Expose the allowed options declared by the normalized descriptor."""
-        control = self.descriptor.get("control", {})
-        return list(control.get("options") or control.get("option_map", {}).keys())
+        return list(self.descriptor.get("control", {}).get("options", []))
 
     @property
     def current_option(self) -> str | None:
@@ -40,14 +39,10 @@ class AionHomeSelectEntity(AionHomeBaseEntity, SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         """Write the selected option back through the AuxCommands endpoint."""
-        control = self.descriptor.get("control", {})
-        raw_value = control.get("option_map", {}).get(option, option)
+        field_name = self.descriptor.get("control", {}).get("field")
         state_patch = await self.coordinator.local_client.async_execute_service_command(
             descriptor=self.descriptor,
             command_type="aux",
-            command_payload=self._build_aux_command_payload(raw_value),
+            command_payload={field_name: option},
         )
-        if state_patch is None:
-            state_patch = {}
-        state_patch["current_option"] = option
         await self.coordinator.async_apply_entity_patch(self._entity_uid, state_patch)

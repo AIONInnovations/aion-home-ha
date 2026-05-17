@@ -51,17 +51,11 @@ class AionHomeSwitchEntity(AionHomeBaseEntity, SwitchEntity):
                 command_value=100 if is_enabled else 0,
             )
         else:
-            raw_value = (
-                control.get("on_value", "1")
-                if is_enabled
-                else control.get("off_value", "0")
-            )
+            payload = {control["field"]: "1" if is_enabled else "0"}
             state_patch = await self.coordinator.local_client.async_execute_service_command(
                 descriptor=self.descriptor,
                 command_type="aux",
-                command_payload=self._build_aux_command_payload(raw_value),
+                command_payload=payload,
             )
-            if state_patch is None:
-                state_patch = {"is_on": is_enabled}
 
         await self.coordinator.async_apply_entity_patch(self._entity_uid, state_patch)
