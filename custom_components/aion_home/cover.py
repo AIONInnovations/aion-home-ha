@@ -48,6 +48,16 @@ class AionHomeCoverEntity(AionHomeBaseEntity, CoverEntity):
         """Mark the cover as closed when its normalized position is zero."""
         return bool(self.descriptor.get("state", {}).get("is_closed", False))
 
+    @property
+    def is_opening(self) -> bool | None:
+        """Report an in-flight upward movement until polling reaches the target."""
+        return self.descriptor.get("state", {}).get("motion_state") == "opening"
+
+    @property
+    def is_closing(self) -> bool | None:
+        """Report an in-flight downward movement until polling reaches the target."""
+        return self.descriptor.get("state", {}).get("motion_state") == "closing"
+
     async def async_open_cover(self, **kwargs) -> None:
         """Open the shutter fully using the primary LAN command contract."""
         state_patch = await self.coordinator.local_client.async_execute_primary(
@@ -55,6 +65,7 @@ class AionHomeCoverEntity(AionHomeBaseEntity, CoverEntity):
             command_value=100,
         )
         await self.coordinator.async_apply_entity_patch(self._entity_uid, state_patch)
+        self.coordinator.async_schedule_cover_completion_refresh(self._entity_uid)
 
     async def async_close_cover(self, **kwargs) -> None:
         """Close the shutter fully using the primary LAN command contract."""
@@ -63,13 +74,17 @@ class AionHomeCoverEntity(AionHomeBaseEntity, CoverEntity):
             command_value=0,
         )
         await self.coordinator.async_apply_entity_patch(self._entity_uid, state_patch)
+        self.coordinator.async_schedule_cover_completion_refresh(self._entity_uid)
 
     async def async_stop_cover(self, **kwargs) -> None:
         """Stop a moving shutter using the firmware's literal stop command."""
-        await self.coordinator.local_client.async_execute_primary(
+        self.coordinator.async_cancel_cover_completion_refresh(self._entity_uid)
+        state_patch = await self.coordinator.local_client.async_execute_primary(
             descriptor=self.descriptor,
             command_value="stop",
         )
+        await self.coordinator.async_apply_entity_patch(self._entity_uid, state_patch)
+        await self.coordinator.async_refresh_entity_local_state(self._entity_uid)
 
     async def async_set_cover_position(self, **kwargs) -> None:
         """Move the shutter to a specific percentage position snapped to the nearest 10."""
@@ -81,3 +96,4 @@ class AionHomeCoverEntity(AionHomeBaseEntity, CoverEntity):
             command_value=snapped_position,
         )
         await self.coordinator.async_apply_entity_patch(self._entity_uid, state_patch)
+        self.coordinator.async_schedule_cover_completion_refresh(self._entity_uid)

@@ -386,14 +386,48 @@ class AionLocalClient:
                 "brightness_percent": brightness,
             }
 
-        if platform == "cover" and numeric_value is not None:
-            if numeric_value == 200 or command_value == "stop":
+        if platform == "cover":
+            if command_value == "stop" or numeric_value == 200:
+                return {"motion_state": None, "target_position": None}
+
+            if numeric_value is None:
                 return None
-            return {"position": numeric_value, "is_closed": numeric_value == 0}
+
+            current_position = self._normalize_cover_position(
+                descriptor.get("state", {}).get("position")
+            )
+            motion_state: str | None = None
+            if current_position is not None:
+                if numeric_value > current_position:
+                    motion_state = "opening"
+                elif numeric_value < current_position:
+                    motion_state = "closing"
+
+            return {
+                "motion_state": motion_state,
+                "target_position": numeric_value,
+                "is_closed": current_position == 0 and motion_state != "opening",
+            }
 
         if platform == "lock" and numeric_value is not None:
             return {"is_locked": numeric_value == 0}
 
+        return None
+
+    def _normalize_cover_position(self, value: Any) -> int | None:
+        """Interpret a cached cover position value as an integer percentage."""
+        if isinstance(value, bool):
+            return 100 if value else 0
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return max(0, min(100, int(value)))
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, str):
+            try:
+                return max(0, min(100, int(float(value.strip()))))
+            except (TypeError, ValueError):
+                return None
         return None
 
     def _build_aux_patch(

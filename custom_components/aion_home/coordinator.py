@@ -13,7 +13,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
@@ -35,6 +35,10 @@ LOGGER = logging.getLogger(__name__)
 # Backoff formula: min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * 2^(n-1)) + jitter
 BASE_BACKOFF_SECONDS = 5
 MAX_BACKOFF_SECONDS = 60
+
+_COVER_TIMER_KEYWORDS = ("timer", "travel", "duration", "runtime", "motor")
+_COVER_OPEN_KEYWORDS = ("open", "up")
+_COVER_CLOSE_KEYWORDS = ("close", "down")
 
 
 def _summarize_entities(entities: list[dict[str, Any]]) -> dict[str, int]:
@@ -72,6 +76,7 @@ class AionHomeDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.local_client = local_client
         self._local_poll_task = None
         self._local_poll_unsub = None
+        self._cover_completion_unsubs: dict[str, Any] = {}
         # Tracks consecutive cloud bootstrap failures for exponential backoff.
         self._failure_count = 0
 
@@ -216,6 +221,9 @@ class AionHomeDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._local_poll_unsub()
             self._local_poll_unsub = None
 
+        for entity_uid in list(self._cover_completion_unsubs):
+            self.async_cancel_cover_completion_refresh(entity_uid)
+
         if self._local_poll_task is not None and not self._local_poll_task.done():
             self._local_poll_task.cancel()
             self._local_poll_task = None
@@ -231,6 +239,88 @@ class AionHomeDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_refresh_local_state(self) -> None:
         """Fetch current local state once and apply it to the cached descriptor map."""
         await self._async_update_local_state()
+
+    async def async_refresh_entity_local_state(self, entity_uid: str) -> None:
+        """Fetch and apply local state for the physical device that owns one entity."""
+        if not self.data:
+            return
+
+        descriptor = self.get_entity(entity_uid)
+        if not descriptor:
+            return
+
+        device_uid = descriptor.get("device", {}).get("device_uid") or ""
+        if not device_uid:
+            return
+
+        try:
+            local_state = await self.local_client.async_fetch_local_state(descriptor)
+        except AionLocalError:
+            updated_data = copy.deepcopy(self.data)
+            if self._patch_device_availability(updated_data, device_uid, available=False):
+                self.async_set_updated_data(updated_data)
+            return
+
+        updated_data = copy.deepcopy(self.data)
+        if self._patch_local_state_snapshot(updated_data, device_uid, local_state):
+            self.async_set_updated_data(updated_data)
+
+    def async_schedule_cover_completion_refresh(self, entity_uid: str) -> None:
+        """Refresh a moving shutter near its predicted end-of-travel time."""
+        self.async_cancel_cover_completion_refresh(entity_uid)
+
+        descriptor = self.get_entity(entity_uid)
+        if not descriptor:
+            return
+
+        state = descriptor.get("state", {})
+        motion_state = state.get("motion_state")
+        if motion_state not in {"opening", "closing"}:
+            return
+
+        target_position = self._normalize_local_numeric_state(state.get("target_position"))
+        current_position = self._normalize_local_numeric_state(state.get("position"))
+        if target_position is None:
+            return
+
+        full_travel_seconds = self._estimate_cover_travel_seconds(descriptor, motion_state)
+        if full_travel_seconds is None:
+            return
+
+        travel_fraction = 1.0
+        if current_position is not None:
+            travel_fraction = abs(target_position - current_position) / 100
+
+        delay_seconds = full_travel_seconds * max(0.0, min(1.0, travel_fraction))
+        if delay_seconds <= 0:
+            return
+
+        expected_motion_state = motion_state
+        expected_target_position = target_position
+        delay_seconds += min(1.0, max(0.25, full_travel_seconds * 0.05))
+
+        @callback
+        def _async_handle_cover_completion(_: datetime) -> None:
+            self._cover_completion_unsubs.pop(entity_uid, None)
+            current_entity = self.get_entity(entity_uid)
+            current_state = current_entity.get("state", {}) if current_entity else {}
+            if current_state.get("motion_state") != expected_motion_state:
+                return
+            if self._normalize_local_numeric_state(current_state.get("target_position")) != expected_target_position:
+                return
+            self.hass.async_create_task(self.async_refresh_entity_local_state(entity_uid))
+
+        self._cover_completion_unsubs[entity_uid] = async_call_later(
+            self.hass,
+            delay_seconds,
+            _async_handle_cover_completion,
+        )
+
+    def async_cancel_cover_completion_refresh(self, entity_uid: str) -> None:
+        """Cancel any pending predicted completion refresh for one shutter."""
+        unsubscribe = self._cover_completion_unsubs.pop(entity_uid, None)
+        if unsubscribe is not None:
+            unsubscribe()
 
     async def _async_update_local_state(self) -> None:
         """Fetch and apply local state for all eligible stateful entities.
@@ -462,7 +552,33 @@ class AionHomeDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if value is None:
                 return None
             position = max(0, min(100, value))
-            return {"position": position, "is_closed": position == 0}
+            target_position = self._normalize_local_numeric_state(
+                current_state.get("target_position")
+            )
+            motion_state = current_state.get("motion_state")
+
+            if (
+                motion_state == "opening"
+                and target_position is not None
+                and position < target_position
+            ):
+                next_motion_state = "opening"
+            elif (
+                motion_state == "closing"
+                and target_position is not None
+                and position > target_position
+            ):
+                next_motion_state = "closing"
+            else:
+                next_motion_state = None
+                target_position = None
+
+            return {
+                "position": position,
+                "is_closed": position == 0 and next_motion_state != "opening",
+                "motion_state": next_motion_state,
+                "target_position": target_position,
+            }
 
         if platform == "lock":
             value = self._normalize_local_numeric_state(local_state)
@@ -484,6 +600,87 @@ class AionHomeDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if isinstance(value, str):
             try:
                 return int(float(value.strip()))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _estimate_cover_travel_seconds(
+        self,
+        descriptor: dict[str, Any],
+        motion_state: str,
+    ) -> float | None:
+        """Resolve a shutter full-travel duration from same-device timer number entities."""
+        if not self.data:
+            return None
+
+        device_uid = descriptor.get("device", {}).get("device_uid")
+        if not device_uid:
+            return None
+
+        number_entities = [
+            entity
+            for entity in self.data.get("entities", [])
+            if entity.get("device", {}).get("device_uid") == device_uid
+            and entity.get("platform") == "number"
+        ]
+        if not number_entities:
+            return None
+
+        directional_keywords = (
+            _COVER_OPEN_KEYWORDS if motion_state == "opening" else _COVER_CLOSE_KEYWORDS
+        )
+        directional_candidates = [
+            entity
+            for entity in number_entities
+            if self._is_cover_timer_entity(entity, directional_keywords)
+        ]
+        generic_candidates = [
+            entity for entity in number_entities if self._is_cover_timer_entity(entity)
+        ]
+
+        if directional_candidates:
+            candidate = directional_candidates[0]
+        elif len(generic_candidates) == 1:
+            candidate = generic_candidates[0]
+        elif len(number_entities) == 1:
+            candidate = number_entities[0]
+        else:
+            return None
+
+        raw_seconds = self._normalize_float(candidate.get("state", {}).get("native_value"))
+        if raw_seconds is None or raw_seconds <= 0:
+            return None
+        if raw_seconds >= 1000:
+            raw_seconds /= 1000
+        return raw_seconds
+
+    def _is_cover_timer_entity(
+        self,
+        entity: dict[str, Any],
+        directional_keywords: tuple[str, ...] = (),
+    ) -> bool:
+        """Check whether a number entity likely represents shutter travel timing."""
+        search_blob = " ".join(
+            [
+                str(entity.get("name", "")),
+                str(entity.get("control", {}).get("field", "")),
+            ]
+        ).lower()
+        if not any(keyword in search_blob for keyword in _COVER_TIMER_KEYWORDS):
+            return False
+        if not directional_keywords:
+            return True
+        return any(keyword in search_blob for keyword in directional_keywords)
+
+    def _normalize_float(self, value: Any) -> float | None:
+        """Interpret a descriptor value as a float when it is numeric-like."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
             except (TypeError, ValueError):
                 return None
         return None
